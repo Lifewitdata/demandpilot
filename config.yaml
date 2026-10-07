@@ -1,0 +1,39 @@
+project:
+  name: demandpilot
+  seed: 42
+
+data:
+  raw_dir: data/raw
+  interim_dir: data/interim
+  processed_dir: data/processed
+  source_url: "https://archive.ics.uci.edu/static/public/502/online+retail+ii.zip"
+  raw_zip: online_retail_II.zip
+  raw_file: online_retail_II.xlsx
+  sheets: ["Year 2009-2010", "Year 2010-2011"]
+  interim_file: transactions.parquet
+
+warehouse:
+  db_file: demand.duckdb
+  weekly_file: weekly_demand.parquet
+  abc_file: abc_classes.parquet
+
+forecast:
+  top_n_skus: 100          # SKUs ranked by total units
+  horizon: 8               # weeks ahead
+  folds: 3                 # rolling-origin validation folds
+  min_history_weeks: 52    # a SKU must have demand history before the first origin
+  seasonality: 52
+
+inventory:
+  lead_time_weeks: 4
+  review_period_weeks: 2
+  holding_cost_per_unit_week: 0.02
+  stockout_cost_per_unit: 2.0
+  service_levels: [0.80, 0.85, 0.90, 0.93, 0.95, 0.97, 0.99]
+  target_service_level: 0.95
+  mc_draws: 20000
+  naive_weeks_of_cover: 2  # rule-of-thumb policy to beat
+
+api:
+  host: 127.0.0.1
+  port: 8000

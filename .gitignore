@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+.pytest_cache/
+
+# Data (regenerate via src/data.py + src/warehouse.py)
+data/raw/*
+data/interim/*
+data/processed/*
+data/*.duckdb
+!data/raw/.gitkeep
+!data/interim/.gitkeep
+!data/processed/.gitkeep
+
+# Model artifacts (regenerate via src/train.py)
+models/*
+!models/.gitkeep
+
+# Env
+.env
+.env.*
