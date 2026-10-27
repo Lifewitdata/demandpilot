@@ -27,6 +27,7 @@ from src.backtest import (
     new_model,
     pivot_units,
     sku_scales,
+    split_at_origin,
 )
 from src.data import ROOT, load_config
 
@@ -75,8 +76,8 @@ def train(cfg: dict) -> dict:
     holdout_start = n_weeks - horizon
 
     pairs = build_pairs(features, horizon)
-    tr = pairs[pairs["target_week_index"] < holdout_start]
-    ev = pairs[pairs["target_week_index"] >= holdout_start].copy()
+    tr, ev = split_at_origin(pairs, holdout_start - 1, horizon)
+    ev = ev.copy()
 
     model = new_model(cfg).fit(
         tr[PAIR_FEATURES].to_numpy(float), tr["y"].to_numpy(float)
@@ -102,7 +103,8 @@ def train(cfg: dict) -> dict:
     results_df = pd.DataFrame(results)
 
     week_map = features[["week_index", "week_start"]].drop_duplicates()
-    holdout = ev[["stock_code", "target_week_index", "h", "y"]].copy()
+    holdout = ev[["stock_code", "week_index", "target_week_index", "h", "y"]].copy()
+    holdout['train_target_max'] = int(tr['target_week_index'].max())
     holdout = holdout.merge(
         week_map.rename(columns={"week_index": "target_week_index"}), how="left"
     )
@@ -135,14 +137,18 @@ def train(cfg: dict) -> dict:
     }
     np.savez_compressed(ROOT / "models" / f"residual_draws_{VERSION}.npz", **draws)
 
+    # Only after the holdout is scored, refit the frozen model configuration on
+    # all observed targets for serving. Calibration still uses validation only.
+    final_model = new_model(cfg).fit(pairs[PAIR_FEATURES].to_numpy(float), pairs['y'].to_numpy(float))
     artifact = {
-        "model": model,
+        "model": final_model,
         "feature_columns": PAIR_FEATURES,
         "bias_factors": bias_factors,
         "horizon": horizon,
         "params": MODEL_PARAMS,
         "trained_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "train_pairs": int(len(tr)),
+        "train_pairs": int(len(pairs)),
+        "trained_through_week_index": int(pairs['target_week_index'].max()),
         "holdout_start_week_index": int(holdout_start),
     }
     artifact_path = ROOT / "models" / f"demand_hgb_{VERSION}.joblib"
@@ -157,7 +163,10 @@ def train(cfg: dict) -> dict:
         "created_at": artifact["trained_at"],
         "horizon": horizon,
         "n_features": len(PAIR_FEATURES),
-        "n_train_pairs": int(len(tr)),
+        "n_train_pairs": int(len(pairs)),
+        "evaluation_train_pairs": int(len(tr)),
+        "trained_through_week_index": artifact['trained_through_week_index'],
+        "evaluation_protocol": "fixed origin, eight unseen target weeks; cohort frozen before all validation",
         "holdout": {
             "wape": round(float(headline["wape"]), 4),
             "mase_macro": round(float(headline["mase_macro"]), 4),

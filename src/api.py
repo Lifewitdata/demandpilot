@@ -123,6 +123,8 @@ def _origin_row(stock_code: str, origin_week: int | None) -> pd.Series:
 
 def _forecast_weeks(row: pd.Series) -> list[ForecastWeek]:
     artifact = _artifact()
+    if int(row['week_index']) < int(artifact['trained_through_week_index']):
+        raise HTTPException(status_code=422, detail='Origin predates this model training cutoff; use stored out-of-sample evaluation, not a model fitted on later targets.')
     intervals = _intervals()
     model = artifact["model"]
     base_cols = [c for c in artifact["feature_columns"] if c != "h"]
@@ -157,6 +159,7 @@ def health() -> dict:
         artifact = _artifact()
         _intervals()
         _features()
+        _policy()
     except FileNotFoundError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {

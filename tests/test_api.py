@@ -1,76 +1,75 @@
-"""Smoke tests for the forecasting service (endpoint behavior + cross-layer consistency)."""
-
+"""Always-on service contracts using deterministic, generated artifacts."""
+from types import SimpleNamespace
+import numpy as np
+import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
+import src.api as api
+from src.features import FEATURE_COLUMNS
 
-from src.api import app
-from src.data import ROOT
+SKU = '85123A'
 
-REGISTRY = ROOT / "models" / "registry.json"
-pytestmark = pytest.mark.skipif(
-    not REGISTRY.exists(), reason="models/registry.json missing -- run src.train first"
-)
-
-SKU = "85123A"
-
-
-@pytest.fixture(scope="module")
-def client() -> TestClient:
-    return TestClient(app)
+@pytest.fixture
+def client(monkeypatch):
+    codes = [SKU] + [f'S{i:03}' for i in range(99)]
+    features = pd.DataFrame([
+        {'stock_code': sku, 'week_index': week, 'week_start': pd.Timestamp('2011-12-05') + pd.Timedelta(weeks=week-105),
+         **{c: 1.0 for c in FEATURE_COLUMNS}}
+        for sku in codes for week in (90, 105)])
+    artifact = {'model': SimpleNamespace(predict=lambda X: np.full(len(X),100.0)),
+                'feature_columns': [*FEATURE_COLUMNS, 'h'], 'bias_factors': {h: 1.0 for h in range(1,9)},
+                'horizon': 8, 'trained_through_week_index': 105}
+    registry = {'version': 'test-fixture', 'horizon':8, 'n_train_pairs': 100,
+                'created_at': '2026-10-28T00:00:00Z', 'holdout': {'wape': 0.5}}
+    policy = pd.DataFrame([{'stock_code': SKU, 'forecast_protection_units':600.0,
+      'opt_service_level':0.95, 'opt_safety_stock':100.0, 'opt_cost':12.0,
+      'target_safety_stock':100.0, 'target_cost':12.0, 'naive_safety_stock':200.0,
+      'naive_cost':24.0, 'naive_achieved_sl':0.8, 'savings_vs_naive_pct':50.0}])
+    monkeypatch.setattr(api,'_registry',lambda:registry)
+    monkeypatch.setattr(api,'_artifact',lambda:artifact)
+    monkeypatch.setattr(api,'_intervals',lambda:{'per_horizon':{str(h):{'q05':-0.5,'q95':0.5} for h in range(1,9)}})
+    monkeypatch.setattr(api,'_features',lambda:features)
+    monkeypatch.setattr(api,'_policy',lambda:policy)
+    return TestClient(api.app)
 
 
 def test_health_endpoint(client):
-    body = client.get("/health").json()
-    assert body["status"] == "ok"
-    assert body["model_version"] == "v1"
-    assert body["horizon"] == 8
-    assert 0 < body["holdout"]["wape"] < 1
+    r=client.get('/health'); assert r.status_code==200
+    assert r.json()['model_version']=='test-fixture'
 
 
 def test_skus_endpoint(client):
-    body = client.get("/skus").json()
-    assert body["n_skus"] == 100
-    assert SKU in body["skus"]
+    b=client.get('/skus').json(); assert b['n_skus']==100 and SKU in b['skus']
 
 
 def test_forecast_shape_and_bands(client):
-    resp = client.get(f"/forecast/{SKU}")
-    assert resp.status_code == 200
-    body = resp.json()
-    weeks = body["forecast"]
-    assert [w["horizon"] for w in weeks] == list(range(1, 9))
-    for w in weeks:
-        assert w["week_index"] == body["origin_week_index"] + w["horizon"]
-        assert 0 <= w["p05"] <= w["p95"]
-        assert w["units"] >= 0
-        assert w["p05"] <= w["units"] + 1e-9 <= w["p95"] + 1e-9
-    starts = [w["week_start"] for w in weeks]
-    assert starts == sorted(starts)
-    last_origin_week = body["origin_week_index"]
-    assert last_origin_week > 100  # default origin is the latest stored week
+    r=client.get(f'/forecast/{SKU}'); assert r.status_code==200
+    b=r.json(); assert b['origin_week_index']==105
+    assert [w['horizon'] for w in b['forecast']]==list(range(1,9))
+    for w in b['forecast']:
+        assert w['week_index']==105+w['horizon']
+        assert 0<=w['p05']<=w['units']<=w['p95']
 
 
-def test_forecast_accepts_historical_origin(client):
-    body = client.get(f"/forecast/{SKU}?origin_week=90").json()
-    assert body["origin_week_index"] == 90
-    assert len(body["forecast"]) == 8
+def test_forecast_rejects_origin_before_training_cutoff(client):
+    assert client.get(f'/forecast/{SKU}?origin_week=90').status_code==422
 
 
-def test_forecast_unknown_sku_and_origin_404(client):
-    assert client.get("/forecast/NOPE").status_code == 404
-    assert client.get(f"/forecast/{SKU}?origin_week=99999").status_code == 404
+def test_unknown_sku_and_origin(client):
+    assert client.get('/forecast/NOPE').status_code==404
+    assert client.get(f'/forecast/{SKU}?origin_week=9999').status_code==404
+    assert client.get('/inventory/NOPE').status_code==404
 
 
-def test_inventory_policy_endpoint(client):
-    body = client.get(f"/inventory/{SKU}").json()
-    assert body["stock_code"] == SKU
-    assert body["opt_cost"] <= body["naive_cost"]
-    assert body["opt_safety_stock"] >= 0
-    assert client.get("/inventory/NOPE").status_code == 404
+def test_inventory_matches_forecast(client):
+    f=client.get(f'/forecast/{SKU}').json()['forecast']
+    p=client.get(f'/inventory/{SKU}').json()
+    assert sum(w['units'] for w in f[:6])==p['forecast_protection_units']
+    assert p['opt_cost']<=p['naive_cost']
 
 
-def test_inventory_protection_units_match_forecast_sum(client):
-    """The API forecast and the inventory layer must agree numerically."""
-    foreseen = client.get(f"/forecast/{SKU}").json()["forecast"][:6]  # h=1..6
-    policy = client.get(f"/inventory/{SKU}").json()
-    assert abs(sum(w["units"] for w in foreseen) - policy["forecast_protection_units"]) <= 1.0
+def test_missing_artifact_returns_503(client,monkeypatch):
+    def missing(): raise FileNotFoundError('test artifact missing')
+    monkeypatch.setattr(api,'_artifact',missing)
+    assert client.get('/health').status_code==503
+    assert client.get(f'/forecast/{SKU}').status_code==503
