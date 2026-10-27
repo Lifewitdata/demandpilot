@@ -69,28 +69,29 @@ def test_features_independent_of_future_weeks():
 def test_lags_and_rolling_use_past_only():
     f = add_features(make_tiny([1, 2, 3, 4, 5, 6]), CFG).set_index("week_index")
     row = f.loc[5]
-    assert row["units_lag1"] == 5
-    assert row["units_lag2"] == 4
-    assert row["units_lag3"] == 3
-    assert row["units_lag4"] == 2
+    assert row["units_lag1"] == 6
+    assert row["units_lag2"] == 5
+    assert row["units_lag3"] == 4
+    assert row["units_lag4"] == 3
     assert np.isnan(row["units_lag8"])
-    assert row["roll4_mean"] == (2 + 3 + 4 + 5) / 4
+    assert row["roll4_mean"] == (3 + 4 + 5 + 6) / 4
     assert np.isnan(row["roll12_mean"])
     assert row["orders_lag1"] == 1
-    assert row["sku_exp_mean"] == (1 + 2 + 3 + 4 + 5) / 5
-    assert row["weeks_since_last_sale"] == 1
+    assert row["sku_exp_mean"] == (1 + 2 + 3 + 4 + 5 + 6) / 6
+    assert row["weeks_since_last_sale"] == 0
 
 
 def test_first_weeks_have_no_history():
     f = add_features(make_tiny(list(range(1, 11))), CFG).set_index("week_index")
     for lag in (1, 2, 3, 4, 8):
-        assert np.isnan(f.loc[lag - 1, f"units_lag{lag}"])
+        if lag > 1:
+            assert np.isnan(f.loc[lag - 2, f"units_lag{lag}"])
 
 
 def test_weeks_since_last_sale_counts_gap():
     f = add_features(make_tiny([0, 0, 5, 0, 0, 0, 0, 0]), CFG).set_index("week_index")
     assert f.loc[0, "weeks_since_last_sale"] == 999
-    assert f.loc[2, "weeks_since_last_sale"] == 999
+    assert f.loc[2, "weeks_since_last_sale"] == 0
     assert f.loc[3, "weeks_since_last_sale"] == 1
     assert f.loc[7, "weeks_since_last_sale"] == 5
 

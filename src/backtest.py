@@ -2,7 +2,7 @@
 
 Design: origins are weekly. For each origin o and horizon h the target is the
 units sold in week o+h, so the model for horizon h only ever sees information
-available at o (all features in src/features.py are shifted). `h` itself is an
+available through o, the last observed week. `h` itself is an
 input feature (PAIR_FEATURES), so one model predicts every step of the horizon
 with horizon-aware accuracy. Three validation folds of 8 weeks each sit
 immediately before the holdout (the last 8 weeks, evaluated in src/train.py).
@@ -60,7 +60,10 @@ def build_pairs(features: pd.DataFrame, horizon: int) -> pd.DataFrame:
             p.merge(units, on=["stock_code", "target_week_index"], how="inner")
         )
     pairs = pd.concat(frames, ignore_index=True)
-    return pairs.dropna(subset=[*FEATURE_COLUMNS, "y"]).reset_index(drop=True)
+    # No-sale weeks have an unknown price, not an unknown demand target.
+    # HGB handles missing prices; keep these zero-demand examples in evaluation.
+    required = [c for c in FEATURE_COLUMNS if not c.startswith('price_')]
+    return pairs.dropna(subset=[*required, 'y']).reset_index(drop=True)
 
 
 def baseline_predictions(
@@ -76,7 +79,7 @@ def baseline_predictions(
     preds: dict[str, np.ndarray] = {}
 
     p = np.full(n, np.nan)
-    idx = o - 1
+    idx = o
     v = idx >= 0
     p[v] = U[idx[v], s[v]]
     preds["naive"] = p
@@ -88,9 +91,9 @@ def baseline_predictions(
     preds["snaive"] = p
 
     p = np.full(n, np.nan)
-    v = o >= 4
+    v = o >= 3
     C = np.vstack([np.zeros((1, U.shape[1])), np.cumsum(U, axis=0)])
-    p[v] = (C[o[v], s[v]] - C[o[v] - 4, s[v]]) / 4.0
+    p[v] = (C[o[v] + 1, s[v]] - C[o[v] - 3, s[v]]) / 4.0
     preds["ma4"] = p
 
     return {k: np.clip(vals, 0, None) for k, vals in preds.items()}
@@ -146,6 +149,16 @@ def eval_metrics(
     return rows
 
 
+def split_at_origin(pairs: pd.DataFrame, origin: int, horizon: int):
+    """One frozen forecast origin; all fitted targets are observed by that date."""
+    train = pairs[pairs['target_week_index'] <= origin]
+    evaluation = pairs[(pairs['week_index'] == origin)
+                       & (pairs['target_week_index'] <= origin + horizon)]
+    if train.empty or evaluation.empty:
+        raise ValueError('Empty training or evaluation window')
+    return train, evaluation
+
+
 def run_backtest(cfg: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
     features = pd.read_parquet(
         ROOT / cfg["data"]["processed_dir"] / "features.parquet"
@@ -166,11 +179,8 @@ def run_backtest(cfg: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
         eval_start = holdout_start - (f + 1) * horizon
         eval_end = eval_start + horizon - 1
         split = f"fold{f}"
-        tr = pairs[pairs["target_week_index"] < eval_start]
-        ev = pairs[
-            (pairs["target_week_index"] >= eval_start)
-            & (pairs["target_week_index"] <= eval_end)
-        ]
+        origin = eval_start - 1
+        tr, ev = split_at_origin(pairs, origin, horizon)
 
         scales = sku_scales(U, eval_start)
         model = new_model(cfg).fit(
@@ -182,7 +192,9 @@ def run_backtest(cfg: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
         for name, pred in predictions.items():
             results += eval_metrics(ev, pred, name, split, scales, sku_pos, horizon)
 
-        resid = ev[["stock_code", "target_week_index", "h", "y"]].copy()
+        resid = ev[["stock_code", "week_index", "target_week_index", "h", "y"]].copy()
+        resid['split'] = split
+        resid['train_target_max'] = int(tr['target_week_index'].max())
         resid["yhat"] = yhat
         resid["rel_resid"] = (
             (resid["y"] - resid["yhat"]) / np.clip(resid["yhat"], 1, None)

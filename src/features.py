@@ -1,8 +1,8 @@
 """Leakage-safe weekly forecasting features for the top-N SKUs.
 
 Row identity is (stock_code, week_start) = the *origin* week. Every feature
-for an origin week uses data at or before that origin only: lags and rolling
-statistics are shifted by at least one week, calendar terms are known in
+for an origin week uses data at or before that origin only: the origin is the
+last fully observed week, and calendar terms are known in
 advance. Targets are formed by joining `units` at origin + horizon in the
 backtest/train modules. tests/test_features.py enforces the no-future rule.
 """
@@ -56,7 +56,25 @@ def select_skus(abc: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     )
 
 
+def training_catalogue(weekly: pd.DataFrame, cfg: dict) -> tuple[pd.DataFrame, pd.Timestamp]:
+    """Freeze the cohort before the earliest validation window, not on all sales."""
+    weekly = weekly.copy()
+    weekly['week_start'] = pd.to_datetime(weekly['week_start'])
+    weeks = pd.date_range(weekly['week_start'].min(), weekly['week_start'].max(), freq='7D')
+    first_eval = len(weeks) - (cfg['forecast']['folds'] + 1) * cfg['forecast']['horizon']
+    if first_eval <= 0:
+        raise ValueError('Insufficient weeks for validation and holdout')
+    cutoff = weeks[first_eval]
+    past = weekly[weekly['week_start'] < cutoff]
+    catalogue = past.groupby('stock_code', as_index=False).agg(
+        total_units=('units', 'sum'), total_revenue=('revenue', 'sum'),
+        active_weeks=('week_start', 'nunique'))
+    return catalogue, cutoff
+
+
 def build_grid(weekly: pd.DataFrame, skus: list[str]) -> pd.DataFrame:
+    weekly = weekly.copy()
+    weekly['week_start'] = pd.to_datetime(weekly['week_start'])
     weeks = pd.date_range(
         weekly["week_start"].min(), weekly["week_start"].max(), freq="7D"
     )
@@ -91,19 +109,19 @@ def add_features(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     g = df.groupby("stock_code", group_keys=False)
 
     for k in (1, 2, 3, 4, 8):
-        df[f"units_lag{k}"] = g["units"].shift(k)
+        df[f"units_lag{k}"] = g["units"].shift(k - 1)
 
-    shifted_units = g["units"].shift(1)
+    shifted_units = df['units']
     df["roll4_mean"] = _rolling(shifted_units, keys, 4, "mean")
     df["roll4_std"] = _rolling(shifted_units, keys, 4, "std")
     df["roll12_mean"] = _rolling(shifted_units, keys, 12, "mean")
     df["roll12_std"] = _rolling(shifted_units, keys, 12, "std")
 
-    shifted_orders = g["orders"].shift(1)
+    shifted_orders = df['orders']
     df["orders_lag1"] = shifted_orders
     df["orders_roll4_mean"] = _rolling(shifted_orders, keys, 4, "mean")
 
-    shifted_price = g["price"].shift(1)
+    shifted_price = df['price']
     df["price_lag1"] = shifted_price
     df["price_exp_mean"] = (
         shifted_price.groupby(keys).expanding(min_periods=1).mean()
@@ -116,8 +134,7 @@ def add_features(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     )
 
     sale_week = df["week_index"].where(df["units"] > 0)
-    last_sale = sale_week.groupby(keys).shift(1)
-    last_sale = last_sale.groupby(keys).ffill()
+    last_sale = sale_week.groupby(keys).ffill()
     df["weeks_since_last_sale"] = (df["week_index"] - last_sale).fillna(999).astype(float)
 
     woy = df["week_start"].dt.isocalendar().week.astype(float)
@@ -133,9 +150,10 @@ def add_features(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
 def build_features(cfg: dict) -> tuple[pd.DataFrame, dict]:
     processed = ROOT / cfg["data"]["processed_dir"]
     weekly = pd.read_parquet(processed / cfg["warehouse"]["weekly_file"])
-    abc = pd.read_parquet(processed / cfg["warehouse"]["abc_file"])
-
+    abc, selection_cutoff = training_catalogue(weekly, cfg)
     top = select_skus(abc, cfg)
+    if len(top) != cfg['forecast']['top_n_skus']:
+        raise ValueError('Not enough SKUs with training-only minimum history')
     skus = top["stock_code"].tolist()
     revenue_share = top["total_revenue"].sum() / abc["total_revenue"].sum()
 
@@ -149,6 +167,10 @@ def build_features(cfg: dict) -> tuple[pd.DataFrame, dict]:
         "n_skus": len(skus),
         "skus": skus,
         "revenue_share_of_selected": round(float(revenue_share), 4),
+        "selection": {
+            "data_before": str(selection_cutoff.date()),
+            "scope": "cohort and revenue share frozen using earliest training window only",
+        },
         "weeks": {
             "min": str(grid["week_start"].min().date()),
             "max": str(grid["week_start"].max().date()),

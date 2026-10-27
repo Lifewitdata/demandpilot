@@ -12,6 +12,7 @@ import sys
 import zipfile
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import requests
 import yaml
@@ -74,7 +75,9 @@ def clean(raw: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     stats: dict[str, int] = {"raw_rows": len(raw)}
     df = raw.rename(columns=RAW_COLUMNS)
 
-    missing_ids = df["invoice_no"].isna() | df["stock_code"].isna()
+    for col in ('invoice_no', 'stock_code'):
+        df[col] = df[col].astype('string').str.strip().str.upper()
+    missing_ids = df["invoice_no"].isna() | df["stock_code"].isna() | df['invoice_no'].eq('') | df['stock_code'].eq('')
     stats["rows_dropped_missing_ids"] = int(missing_ids.sum())
     df = df[~missing_ids].copy()
 
@@ -85,6 +88,9 @@ def clean(raw: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         coerced = pd.to_numeric(df[col], errors="coerce")
         unparseable |= coerced.isna() & df[col].notna()
         df[col] = coerced
+
+    unparseable |= ~np.isfinite(df['quantity']) | ~np.isfinite(df['unit_price'])
+    unparseable |= df['quantity'].mod(1).ne(0)
 
     stats["rows_dropped_unparseable"] = int(unparseable.sum())
     df = df[~unparseable]
